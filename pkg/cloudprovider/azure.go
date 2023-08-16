@@ -37,13 +37,14 @@ const (
 // to the Azure cloud API
 type Azure struct {
 	CloudProvider
-	resourceGroup        string
-	env                  azure.Environment
-	vmClient             compute.VirtualMachinesClient
-	virtualNetworkClient network.VirtualNetworksClient
-	networkClient        network.InterfacesClient
-	nodeMapLock          sync.Mutex
-	nodeLockMap          map[string]*sync.Mutex
+	resourceGroup            string
+	env                      azure.Environment
+	vmClient                 compute.VirtualMachinesClient
+	virtualNetworkClient     network.VirtualNetworksClient
+	networkClient            network.InterfacesClient
+	backendAddressPoolClient network.LoadBalancerBackendAddressPoolsClient
+	nodeMapLock              sync.Mutex
+	nodeLockMap              map[string]*sync.Mutex
 }
 
 func (a *Azure) initCredentials() error {
@@ -98,6 +99,12 @@ func (a *Azure) initCredentials() error {
 	a.virtualNetworkClient = network.NewVirtualNetworksClientWithBaseURI(a.env.ResourceManagerEndpoint, subscriptionID)
 	a.virtualNetworkClient.Authorizer = authorizer
 	_ = a.virtualNetworkClient.AddToUserAgent(UserAgent)
+
+	a.backendAddressPoolClient = network.NewLoadBalancerBackendAddressPoolsClientWithBaseURI(
+		a.env.ResourceManagerEndpoint, subscriptionID)
+	a.backendAddressPoolClient.Authorizer = authorizer
+	_ = a.backendAddressPoolClient.AddToUserAgent(UserAgent)
+
 	return nil
 }
 
@@ -125,14 +132,90 @@ func (a *Azure) AssignPrivateIP(ip net.IP, node *corev1.Node) error {
 	ipConfigurations := *networkInterface.IPConfigurations
 	name := fmt.Sprintf("%s_%s", node.Name, ipc)
 	untrue := false
+
+	loadBalancerBackendAddressPoolsArgument := (*networkInterface.IPConfigurations)[0].LoadBalancerBackendAddressPools
+	var attachedOutboundRule *network.SubResource
+	klog.Infof("riccardo: AssignPrivateIP: all %d IP configurations: %#v ", len((*networkInterface.IPConfigurations)), (*networkInterface.IPConfigurations))
+	// klog.Infof("riccardo: AssignPrivateIP: LoadBalancerBackendAddressPools=%#v ", (*networkInterface.IPConfigurations)[0].LoadBalancerBackendAddressPools)
+	if (*networkInterface.IPConfigurations)[0].LoadBalancerBackendAddressPools != nil {
+		// if BackendAddressPool.OutboundRule is not empty then do not set LoadBalancerBackendAddressPools
+		for ii, ipconfig := range *networkInterface.IPConfigurations {
+			klog.Infof("riccardo: AssignPrivateIP: iterating over ipconfig %d, %#v", ii, ipconfig)
+			// klog.Infof("riccardo: AssignPrivateIP: *(*networkInterface.IPConfigurations)[%d].LoadBalancerBackendAddressPools",
+			// 	ii, *(*networkInterface.IPConfigurations)[ii].LoadBalancerBackendAddressPools)
+			for i, pool := range *(*networkInterface.IPConfigurations)[ii].LoadBalancerBackendAddressPools {
+				klog.Infof("riccardo: AssignPrivateIP: iterating on pool %d: %#v ", i, pool)
+				if pool.ID == nil {
+					continue
+				}
+				klog.Infof("riccardo: AssignPrivateIP: iterating on pool %d: %s", i, *pool.ID)
+
+				// for some reason, the struct for the pool above is not all filled out:
+				//    BackendAddressPoolPropertiesFormat:(*network.BackendAddressPoolPropertiesFormat)(nil)
+				// Do a separate get for this pool in order to check whether there are any outbound rules
+				// attached to it
+				realPool, err := a.getBackendAddressPool(*pool.ID)
+				if err != nil {
+					klog.Errorf("error assigning egress IP", err)
+					continue // return?
+				}
+				klog.Infof("******riccardo: AssignPrivateIP: pool %d is really: %#v", i, realPool)
+
+				// if pool.BackendAddressPoolPropertiesFormat != nil {
+				// 	// pool.BackendAddressPoolPropertiesFormat.
+				// 	klog.Infof("...........riccardo: AssignPrivateIP: LoadBalancerBackendAddressPools[%d] ; pool.BackendAddressPoolPropertiesFormat is: %#v",
+				// 		i, pool.BackendAddressPoolPropertiesFormat)
+
+				// 	if pool.BackendAddressPoolPropertiesFormat.OutboundRules != nil {
+				// 		klog.Infof("...........riccardo: AssignPrivateIP: LoadBalancerBackendAddressPools[%d] has outbound ruleS: %#v", i, pool.OutboundRules)
+				// 		loadBalancerBackendAddressPoolsArgument = nil
+				// 		break
+				// 	}
+				// 	if pool.BackendAddressPoolPropertiesFormat.OutboundRule != nil {
+				// 		klog.Infof("...........riccardo: AssignPrivateIP: LoadBalancerBackendAddressPools[%d] has an outbound rule: %#v; pool is: %#v",
+				// 			i, pool.OutboundRule)
+				// 		loadBalancerBackendAddressPoolsArgument = nil
+				// 		break
+				// 	}
+				// }
+
+				if realPool.BackendAddressPoolPropertiesFormat != nil {
+					// realPool.BackendAddressPoolPropertiesFormat.
+					klog.Infof("+++riccardo: AssignPrivateIP: LoadBalancerBackendAddressPools[%d] ; realPool.BackendAddressPoolPropertiesFormat is: %#v",
+						i, realPool.BackendAddressPoolPropertiesFormat)
+					if realPool.BackendAddressPoolPropertiesFormat.OutboundRule != nil {
+						klog.Infof("++++++++++++++++++++riccardo: AssignPrivateIP: LoadBalancerBackendAddressPools[%d] has an outbound rule: %#v; realPool is: %#v",
+							i, realPool.OutboundRule)
+						loadBalancerBackendAddressPoolsArgument = nil
+						attachedOutboundRule = realPool.BackendAddressPoolPropertiesFormat.OutboundRule
+						break
+					}
+					if realPool.BackendAddressPoolPropertiesFormat.OutboundRules != nil {
+						klog.Infof("++++++++++++++++++++riccardo: AssignPrivateIP: LoadBalancerBackendAddressPools[%d] has outbound ruleS: %#v",
+							i, realPool.OutboundRules)
+						loadBalancerBackendAddressPoolsArgument = nil
+						attachedOutboundRule = &(*realPool.BackendAddressPoolPropertiesFormat.OutboundRules)[0]
+						break
+					}
+				}
+			}
+		}
+	}
+	if loadBalancerBackendAddressPoolsArgument == nil {
+		klog.Warningf("Egress IP %s will have no connectivity outside the cluster: "+
+			"omitting backend address pool when adding secondary IP: it has an outbound rule already: %s",
+			ipc, *attachedOutboundRule.ID)
+	}
+	klog.Infof("riccardo: AssignPrivateIP: loadBalancerBackendAddressPoolsArgument=%#v", loadBalancerBackendAddressPoolsArgument)
 	newIPConfiguration := network.InterfaceIPConfiguration{
 		Name: &name,
 		InterfaceIPConfigurationPropertiesFormat: &network.InterfaceIPConfigurationPropertiesFormat{
-			PrivateIPAddress:                &ipc,
-			PrivateIPAllocationMethod:       network.Static,
-			Subnet:                          (*networkInterface.IPConfigurations)[0].Subnet,
-			Primary:                         &untrue,
-			LoadBalancerBackendAddressPools: (*networkInterface.IPConfigurations)[0].LoadBalancerBackendAddressPools,
+			PrivateIPAddress:          &ipc,
+			PrivateIPAllocationMethod: network.Static,
+			Subnet:                    (*networkInterface.IPConfigurations)[0].Subnet,
+			Primary:                   &untrue,
+			// if BackendAddressPool.OutboundRule is not empty then do not set LoadBalancerBackendAddressPools
+			LoadBalancerBackendAddressPools: loadBalancerBackendAddressPoolsArgument, // (*networkInterface.IPConfigurations)[0].LoadBalancerBackendAddressPools,
 			ApplicationSecurityGroups:       applicationSecurityGroups,
 		},
 	}
@@ -351,6 +434,47 @@ func (a *Azure) getNetworkInterfaces(instance *compute.VirtualMachine) ([]networ
 		return nil, NoNetworkInterfaceError
 	}
 	return networkInterfaces, nil
+}
+
+func splitObjectID(azureResourceID string) (string, string, string) {
+	// example of an azureResourceID:
+	// "/subscriptions/53b8f551-f0fc-4bea-8cba-6d1fefd54c8a/resourceGroups/huirwang-debug1-2qh9t-rg/providers/Microsoft.Network/loadBalancers/huirwang-debug1-2qh9t/backendAddressPools/huirwang-debug1-2qh9t"
+
+	// Split the Azure resource ID into parts using "/"
+	parts := strings.Split(azureResourceID, "/")
+
+	// Iterate through the parts to find the relevant subIDs
+	var resourceGroupName, loadBalancerName, backendAddressPoolName string
+	for i, part := range parts {
+		switch part {
+		case "resourceGroups":
+			if i+1 < len(parts) {
+				resourceGroupName = parts[i+1]
+			}
+		case "loadBalancers":
+			if i+1 < len(parts) {
+				loadBalancerName = parts[i+1]
+			}
+		case "backendAddressPools":
+			if i+1 < len(parts) {
+				backendAddressPoolName = parts[i+1]
+			}
+		}
+	}
+	return resourceGroupName, loadBalancerName, backendAddressPoolName
+}
+
+func (a *Azure) getBackendAddressPool(poolID string) (*network.BackendAddressPool, error) {
+	ctx, cancel := context.WithTimeout(a.ctx, defaultAzureOperationTimeout)
+	defer cancel()
+	resourceGroupName, loadBalancerName, backendAddressPoolName := splitObjectID(poolID)
+	backendAddressPool, err := a.backendAddressPoolClient.Get(ctx, resourceGroupName, loadBalancerName, backendAddressPoolName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to retrieve backend address pool for backendAddressPoolClient=%s, loadBalancerName=%s, backendAddressPoolName=%s: %w",
+			resourceGroupName, loadBalancerName, backendAddressPoolName, err)
+	}
+	return &backendAddressPool, nil
+
 }
 
 func (a *Azure) getNetworkInterface(id string) (network.Interface, error) {
